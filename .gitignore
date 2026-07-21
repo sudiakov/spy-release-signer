@@ -1,0 +1,11 @@
+*
+!.gitignore
+!.github/
+!.github/**
+!config/
+!config/**
+!policies/
+!policies/**
+!scripts/
+!scripts/**
+!README.md

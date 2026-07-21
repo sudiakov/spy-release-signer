@@ -1,0 +1,43 @@
+name: Seal immutable signing policy
+run-name: spy-seal-policy-${{ inputs.release_sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_sha:
+        description: Exact reviewed private source release commit
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: spy-seal-policy-${{ github.run_id }}-${{ github.run_attempt }}
+  cancel-in-progress: false
+
+jobs:
+  seal:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out the reviewed public signer revision
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify the exact public signer template
+        run: |
+          set -euo pipefail
+          python3 scripts/verify-public-template.py --root . --self-test
+
+      - name: Publish the immutable policy ref
+        env:
+          SPY_SIGNER_REPOSITORY_TOKEN: ${{ github.token }}
+          SPY_SOURCE_REPOSITORY: ${{ vars.SPY_SOURCE_REPOSITORY }}
+        run: |
+          set -euo pipefail
+          bash scripts/publish-signing-policy-ref.sh \
+            "${{ inputs.release_sha }}"

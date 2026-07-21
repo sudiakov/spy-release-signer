@@ -1,0 +1,31 @@
+name: Verify signer template
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  verify-template:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out the public signer policy
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify the exact public template boundary
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 scripts/verify-public-template.py --root .
+
+      - name: Prove fail-closed template checks
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 scripts/verify-public-template.py --root . --self-test

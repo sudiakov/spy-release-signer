@@ -1,0 +1,87 @@
+name: Bootstrap release signing key
+run-name:
+  spy-bootstrap-${{ inputs.bootstrap_phase }}-${{ inputs.source_release_sha
+  }}-${{ inputs.signer_sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      bootstrap_phase:
+        description:
+          Prepare keys first; finalize only after manual read-only deploy-key
+          registration
+        required: true
+        type: choice
+        options:
+          - prepare
+          - finalize
+      confirm_signing_key_id:
+        description: Confirm the exact SPY_SIGNING_KEY_ID repository variable
+        required: true
+        type: string
+      confirm_source_deploy_public_key_sha256:
+        description:
+          Finalize only - exact canonical public-key SHA-256 from the prepare
+          summary
+        required: false
+        type: string
+      confirm_source_deploy_key_read_only:
+        description:
+          Finalize only - attest that Allow write access remains unchecked
+        required: true
+        default: false
+        type: boolean
+      source_release_sha:
+        description: Source release selecting the immutable signer policy tag
+        required: true
+        type: string
+      signer_sha:
+        description: Exact immutable signer policy commit
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: spy-signer-key-bootstrap
+  cancel-in-progress: false
+
+jobs:
+  bootstrap:
+    if: >-
+      github.ref == format(
+        'refs/tags/spy-sign-policy-{0}',
+        inputs.source_release_sha
+      ) && github.sha == inputs.signer_sha
+    environment: production-signing
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out the dedicated signer repository
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Prepare or finalize the Ed25519 signing boundary
+        env:
+          SPY_BOOTSTRAP_PHASE: ${{ inputs.bootstrap_phase }}
+          SPY_CONFIRM_SIGNING_KEY_ID: ${{ inputs.confirm_signing_key_id }}
+          SPY_CONFIRM_SOURCE_DEPLOY_KEY_READ_ONLY:
+            ${{ inputs.confirm_source_deploy_key_read_only }}
+          SPY_CONFIRM_SOURCE_DEPLOY_PUBLIC_KEY_SHA256:
+            ${{ inputs.confirm_source_deploy_public_key_sha256 }}
+          SPY_EXISTING_SIGNING_PRIVATE_KEY_B64:
+            ${{ secrets.SPY_RELEASE_SIGNING_PRIVATE_KEY_B64 }}
+          SPY_EXISTING_SOURCE_DEPLOY_PRIVATE_KEY_B64:
+            ${{ secrets.SPY_SOURCE_DEPLOY_PRIVATE_KEY_B64 }}
+          SPY_EXPECTED_SIGNER_SHA: ${{ inputs.signer_sha }}
+          SPY_POLICY_SOURCE_RELEASE_SHA: ${{ inputs.source_release_sha }}
+          SPY_SIGNER_BOOTSTRAP_TOKEN:
+            ${{ inputs.bootstrap_phase == 'prepare' &&
+            secrets.SPY_SIGNER_BOOTSTRAP_TOKEN || '' }}
+          SPY_SIGNER_REPOSITORY_TOKEN: ${{ github.token }}
+          SPY_SIGNING_KEY_ID: ${{ vars.SPY_SIGNING_KEY_ID }}
+          SPY_SOURCE_REPOSITORY: ${{ vars.SPY_SOURCE_REPOSITORY }}
+        run: bash scripts/bootstrap-signing-key.sh

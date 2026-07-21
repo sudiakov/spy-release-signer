@@ -1,0 +1,160 @@
+name: Sign exact Spy release
+run-name:
+  spy-sign-${{ inputs.release_sha }}-${{ inputs.handoff_sha256 }}-${{
+  inputs.signer_sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_sha:
+        description: Exact current private source refs/heads/main commit
+        required: true
+        type: string
+      handoff_sha256:
+        description: SHA-256 of the exact private R2 handoff bundle
+        required: true
+        type: string
+      signer_sha:
+        description: Exact immutable signer policy commit
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  # GitHub keeps at most one pending run per shared group. A run/attempt-derived
+  # group prevents any queued signer handoff from replacing another one.
+  group: spy-sign-${{ github.run_id }}-${{ github.run_attempt }}
+  cancel-in-progress: false
+
+jobs:
+  sign:
+    if: >-
+      github.ref == format(
+        'refs/tags/spy-sign-policy-{0}',
+        inputs.release_sha
+      ) && github.sha == inputs.signer_sha
+    environment: production-signing
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out the public dedicated signer repository
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Load the protected per-release signing policy
+        id: release_policy
+        env:
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          SPY_SOURCE_REPOSITORY: ${{ vars.SPY_SOURCE_REPOSITORY }}
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 scripts/validate-release-policy.py \
+            --policy "policies/${RELEASE_SHA}.policy" \
+            --release-sha "${RELEASE_SHA}" \
+            --source-repository "${SPY_SOURCE_REPOSITORY}" \
+            --github-output "${GITHUB_OUTPUT}"
+
+      - name: Fetch exact source identity and private R2 handoff
+        env:
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          HANDOFF_SHA256: ${{ inputs.handoff_sha256 }}
+          POLICY_GIT_TREE: ${{ steps.release_policy.outputs.approved_git_tree }}
+          SPY_EXPECTED_SIGNER_SHA: ${{ inputs.signer_sha }}
+          SPY_R2_EU_ENDPOINT_HOST: ${{ vars.SPY_R2_EU_ENDPOINT_HOST }}
+          SPY_R2_HANDOFF_BUCKET_NAME: ${{ vars.SPY_R2_HANDOFF_BUCKET_NAME }}
+          SPY_R2_HANDOFF_PRESIGNED_URL:
+            ${{ secrets.SPY_R2_HANDOFF_PRESIGNED_URL }}
+          SPY_SOURCE_DEPLOY_PRIVATE_KEY_B64:
+            ${{ secrets.SPY_SOURCE_DEPLOY_PRIVATE_KEY_B64 }}
+          SPY_SOURCE_REPOSITORY: ${{ vars.SPY_SOURCE_REPOSITORY }}
+        run: |
+          set -euo pipefail
+          source_root="${RUNNER_TEMP}/spy-source-handoff"
+          install -d -m 0700 "${source_root}"
+          bash scripts/fetch-source-handoff.sh \
+            "${RELEASE_SHA}" \
+            "${HANDOFF_SHA256}" \
+            "${POLICY_GIT_TREE}" \
+            "${source_root}"
+
+      - name: Verify fixed policy and create detached Ed25519 response
+        env:
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          HANDOFF_SHA256: ${{ inputs.handoff_sha256 }}
+          SPY_POLICY_BUILDER_IMAGE_DIGEST:
+            ${{ steps.release_policy.outputs.approved_builder_image }}
+          SPY_POLICY_GIT_TREE:
+            ${{ steps.release_policy.outputs.approved_git_tree }}
+          SPY_POLICY_RELEASE_ARCHIVE_SHA256:
+            ${{ steps.release_policy.outputs.approved_release_archive_sha256 }}
+          SPY_POLICY_RELEASE_MANIFEST_SHA256:
+            ${{ steps.release_policy.outputs.approved_release_manifest_sha256 }}
+          SPY_RELEASE_SIGNING_PRIVATE_KEY_B64:
+            ${{ secrets.SPY_RELEASE_SIGNING_PRIVATE_KEY_B64 }}
+          SPY_EXPECTED_SIGNER_SHA: ${{ inputs.signer_sha }}
+          SPY_SIGNER_REPOSITORY_TOKEN: ${{ github.token }}
+          SPY_SIGNING_POLICY_ID:
+            ${{ steps.release_policy.outputs.signing_policy_id }}
+          SPY_SOURCE_REPOSITORY: ${{ vars.SPY_SOURCE_REPOSITORY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          private_key="${RUNNER_TEMP}/spy-release-signing-private.pem"
+          cleanup() {
+            rm -f -- "${private_key}"
+          }
+          trap cleanup EXIT
+          [[ "${SPY_RELEASE_SIGNING_PRIVATE_KEY_B64}" =~ ^[A-Za-z0-9+/]+={0,2}$ ]]
+          printf '%s' "${SPY_RELEASE_SIGNING_PRIVATE_KEY_B64}" |
+            base64 --decode >"${private_key}"
+          chmod 0600 "${private_key}"
+          unset SPY_RELEASE_SIGNING_PRIVATE_KEY_B64
+
+          source_root="${RUNNER_TEMP}/spy-source-handoff"
+          response_root="${RUNNER_TEMP}/spy-signer-response"
+          bash scripts/publish-release-keyring.sh \
+            "${private_key}" \
+            "${SPY_SIGNING_POLICY_ID}" \
+            "${SPY_POLICY_BUILDER_IMAGE_DIGEST}" \
+            "${SPY_POLICY_GIT_TREE}" \
+            "${SPY_POLICY_RELEASE_ARCHIVE_SHA256}" \
+            "${SPY_POLICY_RELEASE_MANIFEST_SHA256}" \
+            "${RELEASE_SHA}" \
+            "${GITHUB_SHA}"
+          /usr/bin/python3 scripts/verify-and-sign-release.py \
+            --request "${source_root}/spy-signer-request-${RELEASE_SHA}.txt" \
+            --source-evidence "${source_root}/SOURCE_EVIDENCE" \
+            --archive "${source_root}/spy-application-${RELEASE_SHA}.tar.gz" \
+            --private-key "${private_key}" \
+            --output-directory "${response_root}" \
+            --release-sha "${RELEASE_SHA}" \
+            --handoff-bundle-sha256 "${HANDOFF_SHA256}" \
+            --source-repository "${SPY_SOURCE_REPOSITORY}" \
+            --approved-builder-image "${SPY_POLICY_BUILDER_IMAGE_DIGEST}" \
+            --approved-git-tree "${SPY_POLICY_GIT_TREE}" \
+            --approved-release-archive-sha256 \
+              "${SPY_POLICY_RELEASE_ARCHIVE_SHA256}" \
+            --approved-release-manifest-sha256 \
+              "${SPY_POLICY_RELEASE_MANIFEST_SHA256}" \
+            --signing-key-id "${SPY_SIGNING_POLICY_ID}" \
+            --signer-repository "${GITHUB_REPOSITORY}" \
+            --signer-workflow-sha "${GITHUB_SHA}"
+
+      - name: Publish one public immutable idempotent signer response
+        env:
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          SPY_SIGNER_REPOSITORY_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          bash scripts/publish-immutable-release.sh \
+            "spy-signed-${RELEASE_SHA}" \
+            "${GITHUB_SHA}" \
+            "Signed Spy release ${RELEASE_SHA}" \
+            "${RUNNER_TEMP}/spy-signer-response" \
+            RELEASE_ATTESTATION \
+            RELEASE_ATTESTATION.sig \
+            SPY_SIGNER_RESULT
