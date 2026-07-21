@@ -77,6 +77,13 @@ its name is the selected `spy-sign-policy-<source-sha>` tag and its type is `tag
 Repository Actions defaults remain read-only; only GitHub-owned actions pinned by full commit SHA
 are allowed; and immutable releases are enabled before bootstrap.
 
+Bootstrap accepts both GitHub disabled states (`404` and `200` with `enabled=false`), enables the
+setting, then requires a fresh `200` response with boolean `enabled=true`. Release publication is
+restart-safe: an existing draft is recovered from the bounded release inventory and all subsequent
+operations remain bound to its numeric release ID. A failed upload may recover only one expected,
+zero-byte `starter` asset with a numeric ID; ambiguous, non-empty, unknown or mismatched state fails
+closed.
+
 CODEOWNERS routes sensitive changes, but no independent human approval exists until a second
 trusted reviewer is configured. That limitation must remain explicit in provisioning evidence.
 

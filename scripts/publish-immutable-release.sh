@@ -77,10 +77,12 @@ for asset_name in "${asset_names[@]}"; do
 done
 
 temporary_body="$(mktemp)"
+temporary_page="$(mktemp)"
+release_id=""
 cleanup() {
   local exit_status="$?"
   trap - EXIT
-  rm -f -- "${temporary_body}"
+  rm -f -- "${temporary_body}" "${temporary_page}"
   unset repository_token
   exit "${exit_status}"
 }
@@ -161,7 +163,31 @@ ensure_exact_tag() {
 }
 
 get_release() {
+  local page=1
+  local page_length
+  local page_matches
   local status
+  local total_matches=0
+
+  if [[ -n "${release_id}" ]]; then
+    status="$(
+      curl \
+        --silent \
+        --show-error \
+        --request GET \
+        --header "Accept: application/vnd.github+json" \
+        --header "Authorization: Bearer ${repository_token}" \
+        --header "X-GitHub-Api-Version: ${api_version}" \
+        --output "${temporary_body}" \
+        --write-out '%{http_code}' \
+        "${api_url}/repos/${repository}/releases/${release_id}"
+    )"
+    case "${status}" in
+      200) return 0 ;;
+      404) return 1 ;;
+      *) fail "GitHub API returned HTTP ${status} while reading the signer release ID" ;;
+    esac
+  fi
 
   status="$(
     curl \
@@ -177,9 +203,53 @@ get_release() {
   )"
   case "${status}" in
     200) return 0 ;;
-    404) return 1 ;;
+    404) ;;
     *) fail "GitHub API returned HTTP ${status} while reading the signer release" ;;
   esac
+
+  while ((page <= 100)); do
+    status="$(
+      curl \
+        --silent \
+        --show-error \
+        --request GET \
+        --header "Accept: application/vnd.github+json" \
+        --header "Authorization: Bearer ${repository_token}" \
+        --header "X-GitHub-Api-Version: ${api_version}" \
+        --output "${temporary_page}" \
+        --write-out '%{http_code}' \
+        "${api_url}/repos/${repository}/releases?per_page=100&page=${page}"
+    )"
+    [[ "${status}" == "200" ]] ||
+      fail "GitHub API returned HTTP ${status} while inventorying draft releases"
+    jq -e 'type == "array" and length <= 100' "${temporary_page}" >/dev/null ||
+      fail "GitHub release inventory is malformed or oversized"
+    page_matches="$(
+      jq \
+        --arg tag "${release_tag}" \
+        '[.[] | select(.tag_name == $tag)] | length' \
+        "${temporary_page}"
+    )"
+    [[ "${page_matches}" =~ ^[0-9]+$ ]] ||
+      fail "GitHub release inventory match count is invalid"
+    total_matches="$((total_matches + page_matches))"
+    ((total_matches <= 1)) ||
+      fail "GitHub release inventory contains duplicate signer tags"
+    if ((page_matches == 1)); then
+      jq \
+        --arg tag "${release_tag}" \
+        '.[] | select(.tag_name == $tag)' \
+        "${temporary_page}" >"${temporary_body}"
+    fi
+    page_length="$(jq 'length' "${temporary_page}")"
+    [[ "${page_length}" =~ ^[0-9]+$ ]] ||
+      fail "GitHub release inventory length is invalid"
+    ((page_length == 100)) || break
+    page="$((page + 1))"
+  done
+  ((page <= 100)) ||
+    fail "GitHub release inventory exceeds the bounded recovery scan"
+  ((total_matches == 1))
 }
 
 ensure_exact_tag
@@ -215,13 +285,29 @@ if ! get_release; then
       make_latest: "false"
     }' \
     >"${create_body}"
-  api_request \
-    POST \
-    "${api_url}/repos/${repository}/releases" \
-    "${temporary_body}" \
-    201 \
-    "${create_body}"
+  create_status="$(
+    curl \
+      --silent \
+      --show-error \
+      --request POST \
+      --header "Accept: application/vnd.github+json" \
+      --header "Authorization: Bearer ${repository_token}" \
+      --header "X-GitHub-Api-Version: ${api_version}" \
+      --header "Content-Type: application/vnd.github+json" \
+      --data-binary "@${create_body}" \
+      --output "${temporary_body}" \
+      --write-out '%{http_code}' \
+      "${api_url}/repos/${repository}/releases"
+  )"
   rm -f -- "${create_body}"
+  case "${create_status}" in
+    201) ;;
+    422)
+      get_release ||
+        fail "release creation conflicted without one recoverable exact release"
+      ;;
+    *) fail "GitHub API returned HTTP ${create_status}; expected 201" ;;
+  esac
 fi
 
 release_is_draft="$(jq -r '.draft' "${temporary_body}")"
@@ -264,10 +350,210 @@ compare_published_assets() {
   done
 }
 
+validate_draft_assets() {
+  local asset_count
+  local asset_name
+  local existing_count
+  local known_count=0
+  local provider_digest
+  local provider_state
+
+  asset_count="$(
+    jq -er \
+      'if (.assets | type) == "array" then (.assets | length) else empty end' \
+      "${temporary_body}"
+  )" ||
+    fail "draft signer release has no asset inventory"
+  [[ "${asset_count}" =~ ^[0-9]+$ ]] ||
+    fail "draft signer release asset count is invalid"
+  ((asset_count <= ${#asset_names[@]})) ||
+    fail "draft signer release contains unexpected assets"
+  for asset_name in "${asset_names[@]}"; do
+    existing_count="$(
+      jq \
+        --arg name "${asset_name}" \
+        '[.assets[] | select(.name == $name)] | length' \
+        "${temporary_body}"
+    )"
+    case "${existing_count}" in
+      0) ;;
+      1)
+        provider_state="$(
+          jq -er \
+            --arg name "${asset_name}" \
+            '.assets[] | select(.name == $name) | .state' \
+            "${temporary_body}"
+        )" || fail "existing draft asset has no provider state"
+        [[ "${provider_state}" == "uploaded" ]] ||
+          fail "existing draft asset is not fully uploaded"
+        provider_digest="$(
+          jq -er \
+            --arg name "${asset_name}" \
+            '.assets[] | select(.name == $name) | .digest' \
+            "${temporary_body}"
+        )" || fail "existing draft asset has no provider digest"
+        [[ "${provider_digest}" == "sha256:${local_digests["${asset_name}"]}" ]] ||
+          fail "existing draft asset differs; refusing to overwrite"
+        known_count="$((known_count + 1))"
+        ;;
+      *) fail "draft signer release contains duplicate asset names" ;;
+    esac
+  done
+  ((asset_count == known_count)) ||
+    fail "draft signer release contains an unexpected asset name"
+}
+
+recover_starter_assets() {
+  local asset_count
+  local asset_id
+  local asset_name
+  local existing_count
+  local known_count=0
+  local provider_digest
+  local provider_size
+  local provider_state
+  local -a recoverable_asset_ids=()
+
+  asset_count="$(
+    jq -er \
+      'if (.assets | type) == "array" then (.assets | length) else empty end' \
+      "${temporary_body}"
+  )" ||
+    fail "draft signer release has no asset inventory"
+  [[ "${asset_count}" =~ ^[0-9]+$ ]] ||
+    fail "draft signer release asset count is invalid"
+  ((asset_count <= ${#asset_names[@]})) ||
+    fail "draft signer release contains unexpected assets"
+  for asset_name in "${asset_names[@]}"; do
+    existing_count="$(
+      jq \
+        --arg name "${asset_name}" \
+        '[.assets[] | select(.name == $name)] | length' \
+        "${temporary_body}"
+    )"
+    case "${existing_count}" in
+      0) ;;
+      1)
+        provider_state="$(
+          jq -er \
+            --arg name "${asset_name}" \
+            '.assets[] | select(.name == $name) | .state' \
+            "${temporary_body}"
+        )" || fail "existing draft asset has no provider state"
+        case "${provider_state}" in
+          uploaded)
+            provider_digest="$(
+              jq -er \
+                --arg name "${asset_name}" \
+                '.assets[] | select(.name == $name) | .digest' \
+                "${temporary_body}"
+            )" || fail "existing draft asset has no provider digest"
+            [[ "${provider_digest}" == "sha256:${local_digests["${asset_name}"]}" ]] ||
+              fail "existing draft asset differs; refusing to overwrite"
+            ;;
+          starter)
+            provider_size="$(
+              jq -er \
+                --arg name "${asset_name}" \
+                '.assets[] | select(.name == $name) | .size' \
+                "${temporary_body}"
+            )" || fail "recoverable draft asset has no provider size"
+            [[ "${provider_size}" == "0" ]] ||
+              fail "non-empty starter asset cannot be recovered safely"
+            asset_id="$(
+              jq -er \
+                --arg name "${asset_name}" \
+                '.assets[] | select(.name == $name) | .id' \
+                "${temporary_body}"
+            )" || fail "recoverable draft asset has no provider ID"
+            [[ "${asset_id}" =~ ^[0-9]+$ ]] ||
+              fail "recoverable draft asset ID is invalid"
+            recoverable_asset_ids+=("${asset_id}")
+            ;;
+          *) fail "existing draft asset has an unsafe provider state" ;;
+        esac
+        known_count="$((known_count + 1))"
+        ;;
+      *) fail "draft signer release contains duplicate asset names" ;;
+    esac
+  done
+  ((asset_count == known_count)) ||
+    fail "draft signer release contains an unexpected asset name"
+  ((${#recoverable_asset_ids[@]} <= 1)) ||
+    fail "draft signer release contains multiple recoverable starter assets"
+
+  for asset_id in "${recoverable_asset_ids[@]}"; do
+    api_request \
+      DELETE \
+      "${api_url}/repos/${repository}/releases/assets/${asset_id}" \
+      /dev/null \
+      204
+    get_release ||
+      fail "draft signer release disappeared during starter-asset recovery"
+    validate_release_identity true
+  done
+}
+
+upload_asset() {
+  local asset_name="$1"
+  local attempt
+  local encoded_name
+  local status
+
+  encoded_name="$(
+    jq -rn --arg value "${asset_name}" '$value | @uri'
+  )"
+  for attempt in 1 2; do
+    status="$(
+      curl \
+        --silent \
+        --show-error \
+        --request POST \
+        --header "Accept: application/vnd.github+json" \
+        --header "Authorization: Bearer ${repository_token}" \
+        --header "X-GitHub-Api-Version: ${api_version}" \
+        --header "Content-Type: application/octet-stream" \
+        --data-binary "@${asset_root}/${asset_name}" \
+        --output "${temporary_body}" \
+        --write-out '%{http_code}' \
+        "${upload_url}/repos/${repository}/releases/${release_id}/assets?name=${encoded_name}"
+    )"
+    case "${status}" in
+      201) return 0 ;;
+      422 | 502)
+        get_release ||
+          fail "draft signer release disappeared after an asset upload failure"
+        validate_release_identity true
+        recover_starter_assets
+        validate_draft_assets
+        if [[ "$(
+          jq \
+            --arg name "${asset_name}" \
+            '[.assets[] | select(.name == $name and .state == "uploaded")] | length' \
+            "${temporary_body}"
+        )" == "1" ]]; then
+          return 0
+        fi
+        if [[ "${status}" == "422" ]]; then
+          fail "asset upload conflicted without one exact uploaded asset"
+        fi
+        ((attempt == 1)) ||
+          fail "asset upload returned HTTP 502 twice"
+        ;;
+      *) fail "GitHub asset upload returned HTTP ${status}; expected 201" ;;
+    esac
+  done
+  fail "asset upload retry budget was exhausted"
+}
+
 if [[ "${release_is_draft}" == "false" ]]; then
+  published_release_id="${release_id}"
   ensure_exact_tag
+  release_id=""
   get_release ||
     fail "published signer release disappeared"
+  [[ "$(jq -er '.id' "${temporary_body}")" == "${published_release_id}" ]] ||
+    fail "published signer tag resolves to another release ID"
   validate_release_identity false
   [[ "$(jq -r '.immutable' "${temporary_body}")" == "true" ]] ||
     fail "published signer release is not immutable"
@@ -276,6 +562,8 @@ if [[ "${release_is_draft}" == "false" ]]; then
   exit 0
 fi
 
+recover_starter_assets
+validate_draft_assets
 for asset_name in "${asset_names[@]}"; do
   existing_count="$(
     jq \
@@ -285,16 +573,7 @@ for asset_name in "${asset_names[@]}"; do
   )"
   case "${existing_count}" in
     0)
-      encoded_name="$(
-        jq -rn --arg value "${asset_name}" '$value | @uri'
-      )"
-      api_request \
-        POST \
-        "${upload_url}/repos/${repository}/releases/${release_id}/assets?name=${encoded_name}" \
-        "${temporary_body}" \
-        201 \
-        "${asset_root}/${asset_name}" \
-        "application/octet-stream"
+      upload_asset "${asset_name}"
       ;;
     1)
       provider_digest="$(
@@ -325,9 +604,13 @@ api_request \
   "${publish_body}"
 rm -f -- "${publish_body}"
 validate_release_identity false
+published_release_id="${release_id}"
 ensure_exact_tag
+release_id=""
 get_release ||
   fail "published signer release disappeared"
+[[ "$(jq -er '.id' "${temporary_body}")" == "${published_release_id}" ]] ||
+  fail "published signer tag resolves to another release ID"
 validate_release_identity false
 [[ "$(jq -r '.immutable' "${temporary_body}")" == "true" ]] ||
   fail "published signer release did not become immutable"

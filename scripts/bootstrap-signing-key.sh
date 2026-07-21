@@ -125,6 +125,60 @@ delete_repository_secret() {
   esac
 }
 
+ensure_immutable_releases() {
+  local attempt
+  local immutable_enabled
+  local immutable_status
+
+  for attempt in 1 2; do
+    immutable_status="$(
+      curl \
+        --silent \
+        --show-error \
+        --request GET \
+        --header "Accept: application/vnd.github+json" \
+        --header "Authorization: Bearer ${bootstrap_token}" \
+        --header "X-GitHub-Api-Version: ${api_version}" \
+        --output "${temporary_root}/immutable.json" \
+        --write-out '%{http_code}' \
+        "${api_url}/repos/${repository}/immutable-releases"
+    )"
+    case "${immutable_status}" in
+      200)
+        immutable_enabled="$(
+          jq -r \
+            'if (.enabled | type) == "boolean" then .enabled else "invalid" end' \
+            "${temporary_root}/immutable.json"
+        )"
+        case "${immutable_enabled}" in
+          true) return 0 ;;
+          false) ;;
+          *) fail "immutable release policy response is malformed" ;;
+        esac
+        ;;
+      404) ;;
+      *) fail "immutable release policy check returned HTTP ${immutable_status}" ;;
+    esac
+    ((attempt == 1)) ||
+      fail "signer repository immutable releases remain disabled"
+    immutable_status="$(
+      curl \
+        --silent \
+        --show-error \
+        --request PUT \
+        --header "Accept: application/vnd.github+json" \
+        --header "Authorization: Bearer ${bootstrap_token}" \
+        --header "X-GitHub-Api-Version: ${api_version}" \
+        --output /dev/null \
+        --write-out '%{http_code}' \
+        "${api_url}/repos/${repository}/immutable-releases"
+    )"
+    [[ "${immutable_status}" == "204" ]] ||
+      fail "immutable releases could not be enabled"
+  done
+  fail "signer repository immutable releases are not enabled"
+}
+
 cleanup() {
   local exit_status="$?"
   local signer_delete_status=0
@@ -489,50 +543,7 @@ else
   [[ -n "${bootstrap_token}" ]] ||
     fail "prepare requires its one-time signer bootstrap token"
 
-  immutable_status="$(
-    curl \
-      --silent \
-      --show-error \
-      --request GET \
-      --header "Accept: application/vnd.github+json" \
-      --header "Authorization: Bearer ${bootstrap_token}" \
-      --header "X-GitHub-Api-Version: ${api_version}" \
-      --output "${temporary_root}/immutable.json" \
-      --write-out '%{http_code}' \
-      "${api_url}/repos/${repository}/immutable-releases"
-  )"
-  case "${immutable_status}" in
-    200) ;;
-    404)
-      immutable_status="$(
-        curl \
-          --silent \
-          --show-error \
-          --request PUT \
-          --header "Accept: application/vnd.github+json" \
-          --header "Authorization: Bearer ${bootstrap_token}" \
-          --header "X-GitHub-Api-Version: ${api_version}" \
-          --output /dev/null \
-          --write-out '%{http_code}' \
-          "${api_url}/repos/${repository}/immutable-releases"
-      )"
-      [[ "${immutable_status}" == "204" ]] ||
-        fail "immutable releases could not be enabled"
-      curl \
-        --fail \
-        --silent \
-        --show-error \
-        --request GET \
-        --header "Accept: application/vnd.github+json" \
-        --header "Authorization: Bearer ${bootstrap_token}" \
-        --header "X-GitHub-Api-Version: ${api_version}" \
-        --output "${temporary_root}/immutable.json" \
-        "${api_url}/repos/${repository}/immutable-releases"
-      ;;
-    *) fail "immutable release policy check returned HTTP ${immutable_status}" ;;
-  esac
-  [[ "$(jq -r '.enabled' "${temporary_root}/immutable.json")" == "true" ]] ||
-    fail "signer repository immutable releases are not enabled"
+  ensure_immutable_releases
 
   environment_secret_count() {
     local secret_name="$1"
