@@ -258,12 +258,22 @@ decode_existing_keys() {
 }
 
 derive_source_public_key() {
+  local key_comment
+  local key_data
+  local key_type
+
   ssh-keygen -y -f "${source_deploy_private_key}" \
     >"${source_deploy_public_key}" 2>/dev/null
-  grep -Eq '^ssh-ed25519 [A-Za-z0-9+/]+={0,2}$' \
-    "${source_deploy_public_key}" ||
+  [[ "$(wc -l <"${source_deploy_public_key}")" == "1" ]] ||
     fail "source deploy key is not canonical Ed25519"
-  cut -d ' ' -f1-2 "${source_deploy_public_key}" \
+  # OpenSSH may append an opaque private-key comment; key identity is two fields.
+  IFS=' ' read -r key_type key_data key_comment \
+    <"${source_deploy_public_key}"
+  [[ "${key_type}" == "ssh-ed25519" ]] ||
+    fail "source deploy key is not canonical Ed25519"
+  [[ "${key_data}" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] ||
+    fail "source deploy key is not canonical Ed25519"
+  printf '%s %s\n' "${key_type}" "${key_data}" \
     >"${source_deploy_public_canonical}"
 }
 
