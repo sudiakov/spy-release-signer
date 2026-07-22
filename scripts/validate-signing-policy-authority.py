@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import hashlib
 import json
 import re
@@ -14,8 +15,9 @@ from typing import Any, NoReturn
 
 GIT_ID = re.compile(r"^[a-f0-9]{40}$")
 SHA256 = re.compile(r"^[a-f0-9]{64}$")
-REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 POLICY_TAG = re.compile(r"^spy-sign-policy-([a-f0-9]{40})$")
+SIGNER_REPOSITORY = "sudiakov/spy-release-signer"
+SOURCE_REPOSITORY = "sudiakov/spy"
 ASSET_NAMES = {
     "SIGNING_POLICY_REF",
     "SIGNING_POLICY_REF_MANIFEST.sha256",
@@ -46,6 +48,7 @@ POLICY_FIELDS = (
 MAX_JSON_BYTES = 1024 * 1024
 MAX_EVIDENCE_BYTES = 16 * 1024
 MAX_AUTHORITY_FILE_BYTES = 256 * 1024
+MAX_GITHUB_INVENTORY_ITEMS = 100
 
 
 class AuthorityError(ValueError):
@@ -106,6 +109,109 @@ def sha256(path: Path, limit: int) -> str:
     return hashlib.sha256(read_bytes(path, limit)).hexdigest()
 
 
+def complete_inventory(
+    payload: Any,
+    field: str,
+    label: str,
+) -> list[dict[str, Any]]:
+    if not isinstance(payload, dict) or not isinstance(payload.get(field), list):
+        fail(f"{label} API has no inventory")
+    items = payload[field]
+    total_count = payload.get("total_count")
+    if (
+        not isinstance(total_count, int)
+        or isinstance(total_count, bool)
+        or total_count < 0
+        or total_count > MAX_GITHUB_INVENTORY_ITEMS
+        or total_count != len(items)
+        or any(not isinstance(item, dict) for item in items)
+    ):
+        fail(f"{label} API inventory is incomplete or malformed")
+    return items
+
+
+def validate_run_binding(
+    run: dict[str, Any],
+    repository: str,
+    signer_tag: str,
+    signer_sha: str,
+    *,
+    require_first_attempt: bool,
+) -> int:
+    run_id = run.get("id")
+    run_attempt = run.get("run_attempt")
+    repository_metadata = run.get("repository")
+    workflow_path = ".github/workflows/sign-release.yml"
+    allowed_workflow_paths = {
+        workflow_path,
+        f"{workflow_path}@{signer_tag}",
+        f"{workflow_path}@refs/tags/{signer_tag}",
+    }
+    if (
+        not isinstance(run_id, int)
+        or isinstance(run_id, bool)
+        or run_id <= 0
+        or run.get("event") != "workflow_dispatch"
+        or run.get("head_branch") != signer_tag
+        or run.get("head_sha") != signer_sha
+        or run.get("path") not in allowed_workflow_paths
+        or not isinstance(run_attempt, int)
+        or isinstance(run_attempt, bool)
+        or run_attempt < 1
+        or (require_first_attempt and run_attempt != 1)
+        or run.get("url")
+        != f"https://api.github.com/repos/{repository}/actions/runs/{run_id}"
+        or run.get("html_url")
+        != f"https://github.com/{repository}/actions/runs/{run_id}"
+        or run.get("jobs_url")
+        != f"https://api.github.com/repos/{repository}/actions/runs/{run_id}/jobs"
+        or not isinstance(repository_metadata, dict)
+        or repository_metadata.get("full_name") != repository
+    ):
+        fail("dispatched run is not bound to the exact policy tag and commit")
+    return run_id
+
+
+def validate_inventory_run_binding(
+    run: dict[str, Any],
+    repository: str,
+    signer_sha: str,
+) -> int:
+    run_id = run.get("id")
+    run_attempt = run.get("run_attempt")
+    repository_metadata = run.get("repository")
+    inventory_tag = run.get("head_branch")
+    workflow_path = ".github/workflows/sign-release.yml"
+    allowed_workflow_paths = {
+        workflow_path,
+        f"{workflow_path}@{inventory_tag}",
+        f"{workflow_path}@refs/tags/{inventory_tag}",
+    }
+    if (
+        not isinstance(run_id, int)
+        or isinstance(run_id, bool)
+        or run_id <= 0
+        or run.get("event") != "workflow_dispatch"
+        or not isinstance(inventory_tag, str)
+        or POLICY_TAG.fullmatch(inventory_tag) is None
+        or run.get("head_sha") != signer_sha
+        or run.get("path") not in allowed_workflow_paths
+        or not isinstance(run_attempt, int)
+        or isinstance(run_attempt, bool)
+        or run_attempt < 1
+        or run.get("url")
+        != f"https://api.github.com/repos/{repository}/actions/runs/{run_id}"
+        or run.get("html_url")
+        != f"https://github.com/{repository}/actions/runs/{run_id}"
+        or run.get("jobs_url")
+        != f"https://api.github.com/repos/{repository}/actions/runs/{run_id}/jobs"
+        or not isinstance(repository_metadata, dict)
+        or repository_metadata.get("full_name") != repository
+    ):
+        fail("workflow run inventory is outside the canonical signer authority")
+    return run_id
+
+
 def validate_asset(
     release: dict[str, Any],
     name: str,
@@ -150,7 +256,7 @@ def validate_authority(arguments: argparse.Namespace) -> None:
     if (
         GIT_ID.fullmatch(release_sha) is None
         or GIT_ID.fullmatch(signer_sha) is None
-        or REPOSITORY.fullmatch(repository) is None
+        or repository != SIGNER_REPOSITORY
         or POLICY_TAG.fullmatch(signer_tag) is None
         or signer_tag != expected_tag
     ):
@@ -253,7 +359,7 @@ def validate_authority(arguments: argparse.Namespace) -> None:
     if (
         policy["format"] != "spy-release-signing-policy-v2"
         or policy["git_commit"] != release_sha
-        or REPOSITORY.fullmatch(policy["source_repository"]) is None
+        or policy["source_repository"] != SOURCE_REPOSITORY
         or GIT_ID.fullmatch(policy["git_tree"]) is None
         or SHA256.fullmatch(policy["release_archive_sha256"]) is None
         or SHA256.fullmatch(policy["release_manifest_sha256"]) is None
@@ -276,14 +382,44 @@ def validate_authority(arguments: argparse.Namespace) -> None:
     )
 
 
+def validate_baseline(arguments: argparse.Namespace) -> None:
+    repository = arguments.repository
+    signer_tag = arguments.signer_tag
+    signer_sha = arguments.signer_sha
+    if (
+        repository != SIGNER_REPOSITORY
+        or POLICY_TAG.fullmatch(signer_tag) is None
+        or GIT_ID.fullmatch(signer_sha) is None
+    ):
+        fail("expected signer baseline identity is not canonical")
+    runs = complete_inventory(
+        read_json(arguments.runs_json),
+        "workflow_runs",
+        "workflow run",
+    )
+    run_ids = [
+        validate_inventory_run_binding(
+            run,
+            repository,
+            signer_sha,
+        )
+        for run in runs
+    ]
+    if len(set(run_ids)) != len(run_ids):
+        fail("workflow run baseline contains duplicate run IDs")
+    print(max(run_ids, default=0))
+
+
 def validate_run(arguments: argparse.Namespace) -> None:
     release_sha = arguments.release_sha
     handoff_sha256 = arguments.handoff_sha256
+    repository = arguments.repository
     signer_tag = arguments.signer_tag
     signer_sha = arguments.signer_sha
     if (
         GIT_ID.fullmatch(release_sha) is None
         or SHA256.fullmatch(handoff_sha256) is None
+        or repository != SIGNER_REPOSITORY
         or signer_tag != f"spy-sign-policy-{release_sha}"
         or GIT_ID.fullmatch(signer_sha) is None
         or arguments.baseline_run_id < 0
@@ -291,21 +427,23 @@ def validate_run(arguments: argparse.Namespace) -> None:
         fail("expected signer run identity is not canonical")
     payload = read_json(arguments.run_json)
     if isinstance(payload, dict) and "workflow_runs" in payload:
-        runs = payload.get("workflow_runs")
+        runs = complete_inventory(payload, "workflow_runs", "workflow run")
+        for run in runs:
+            validate_inventory_run_binding(
+                run,
+                repository,
+                signer_sha,
+            )
     elif isinstance(payload, dict):
         runs = [payload]
     else:
         fail("workflow run API did not return a JSON object")
-    if not isinstance(runs, list):
-        fail("workflow run API has no run inventory")
 
     title = (
         f"spy-sign-{release_sha}-{handoff_sha256}-{signer_sha}"
     )
     relevant: list[dict[str, Any]] = []
     for run in runs:
-        if not isinstance(run, dict):
-            fail("workflow run inventory contains a non-object")
         run_id = run.get("id")
         if (
             isinstance(run_id, int)
@@ -319,17 +457,140 @@ def validate_run(arguments: argparse.Namespace) -> None:
     if len(relevant) != 1:
         fail("exact dispatch did not resolve to one new workflow run")
     run = relevant[0]
+    run_id = validate_run_binding(
+        run,
+        repository,
+        signer_tag,
+        signer_sha,
+        require_first_attempt=True,
+    )
+    print(run_id)
+
+
+def valid_started_at(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = datetime.datetime.strptime(
+            value,
+            "%Y-%m-%dT%H:%M:%SZ",
+        ).replace(tzinfo=datetime.UTC)
+    except ValueError:
+        return False
+    return parsed.year >= 2020
+
+
+def validate_job(arguments: argparse.Namespace) -> None:
+    repository = arguments.repository
+    signer_sha = arguments.signer_sha
+    run_id = arguments.run_id
     if (
-        run.get("event") != "workflow_dispatch"
-        or run.get("head_branch") != signer_tag
-        or run.get("head_sha") != signer_sha
-        or run.get("path") != ".github/workflows/sign-release.yml"
-        or not isinstance(run.get("run_attempt"), int)
-        or isinstance(run.get("run_attempt"), bool)
-        or run["run_attempt"] < 1
+        repository != SIGNER_REPOSITORY
+        or GIT_ID.fullmatch(signer_sha) is None
+        or run_id <= 0
     ):
-        fail("dispatched run is not bound to the exact policy tag and commit")
-    print(run["id"])
+        fail("expected signer job identity is not canonical")
+    jobs = complete_inventory(
+        read_json(arguments.jobs_json),
+        "jobs",
+        "workflow jobs",
+    )
+    relevant = [
+        job
+        for job in jobs
+        if isinstance(job, dict) and job.get("name") == "sign"
+    ]
+    if len(relevant) > 1:
+        fail("exact signer run contains duplicate sign jobs")
+    if not relevant:
+        print(
+            json.dumps(
+                {
+                    "classification": "absent",
+                    "job_id": 0,
+                    "status": "absent",
+                    "conclusion": "",
+                    "start_proven": False,
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
+        return
+
+    job = relevant[0]
+    job_id = job.get("id")
+    status = job.get("status")
+    conclusion = job.get("conclusion")
+    if (
+        not isinstance(job_id, int)
+        or isinstance(job_id, bool)
+        or job_id <= 0
+        or job.get("run_id") != run_id
+        or job.get("head_sha") != signer_sha
+        or job.get("run_url")
+        != f"https://api.github.com/repos/{repository}/actions/runs/{run_id}"
+        or job.get("url")
+        != f"https://api.github.com/repos/{repository}/actions/jobs/{job_id}"
+        or status
+        not in {
+            "requested",
+            "waiting",
+            "pending",
+            "queued",
+            "in_progress",
+            "completed",
+        }
+    ):
+        fail("signer job is not bound to the exact run and repository")
+
+    runner_id = job.get("runner_id")
+    runner_name = job.get("runner_name")
+    start_proven = (
+        valid_started_at(job.get("started_at"))
+        and isinstance(runner_id, int)
+        and not isinstance(runner_id, bool)
+        and runner_id > 0
+        and isinstance(runner_name, str)
+        and bool(runner_name)
+        and all(32 <= ord(character) <= 126 for character in runner_name)
+    )
+    if status == "completed":
+        if (
+            not isinstance(conclusion, str)
+            or not conclusion
+            or not re.fullmatch(r"[a-z_]+", conclusion)
+        ):
+            fail("completed signer job has no canonical conclusion")
+        classification = (
+            "started"
+            if start_proven and conclusion not in {"cancelled", "skipped"}
+            else "terminal"
+        )
+    elif status == "in_progress":
+        if conclusion is not None or not start_proven:
+            fail("in-progress signer job has no canonical runner-start evidence")
+        classification = "started"
+        conclusion = ""
+    else:
+        if conclusion is not None or start_proven:
+            fail("pre-start signer job contains contradictory execution evidence")
+        classification = "prestart"
+        conclusion = ""
+
+    print(
+        json.dumps(
+            {
+                "classification": classification,
+                "job_id": job_id,
+                "status": status,
+                "conclusion": conclusion,
+                "start_proven": start_proven,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -352,15 +613,30 @@ def build_parser() -> argparse.ArgumentParser:
     authority.add_argument("--template-contract", type=Path, required=True)
     authority.set_defaults(handler=validate_authority)
 
+    baseline = subparsers.add_parser("baseline")
+    baseline.add_argument("--repository", required=True)
+    baseline.add_argument("--signer-tag", required=True)
+    baseline.add_argument("--signer-sha", required=True)
+    baseline.add_argument("--runs-json", type=Path, required=True)
+    baseline.set_defaults(handler=validate_baseline)
+
     run = subparsers.add_parser("run")
     run.add_argument("--release-sha", required=True)
     run.add_argument("--handoff-sha256", required=True)
+    run.add_argument("--repository", required=True)
     run.add_argument("--signer-tag", required=True)
     run.add_argument("--signer-sha", required=True)
     run.add_argument("--baseline-run-id", type=int, required=True)
     run.add_argument("--run-json", type=Path, required=True)
     run.add_argument("--allow-none", action="store_true")
     run.set_defaults(handler=validate_run)
+
+    job = subparsers.add_parser("job")
+    job.add_argument("--repository", required=True)
+    job.add_argument("--signer-sha", required=True)
+    job.add_argument("--run-id", type=int, required=True)
+    job.add_argument("--jobs-json", type=Path, required=True)
+    job.set_defaults(handler=validate_job)
     return parser
 
 
