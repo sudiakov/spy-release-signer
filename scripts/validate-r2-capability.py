@@ -47,13 +47,52 @@ def fail(message: str) -> NoReturn:
     raise ValueError(message)
 
 
-def parse_arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
+def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--expected-endpoint-host", required=True)
     parser.add_argument("--expected-bucket", required=True)
     parser.add_argument("--release-sha", required=True)
     parser.add_argument("--handoff-sha256", required=True)
-    parser.add_argument("--curl-config", required=True, type=Path)
+
+
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="mode", required=True)
+
+    workflow_parser = subparsers.add_parser("workflow")
+    add_common_arguments(workflow_parser)
+    workflow_parser.add_argument("--curl-config", required=True, type=Path)
+
+    dispatcher_parser = subparsers.add_parser("dispatcher")
+    add_common_arguments(dispatcher_parser)
+    dispatcher_parser.add_argument(
+        "--capability-file",
+        required=True,
+        type=Path,
+    )
+    dispatcher_parser.add_argument(
+        "--expected-file-identity",
+        required=True,
+    )
+    dispatcher_parser.add_argument(
+        "--expected-owner-uid",
+        required=True,
+        type=int,
+    )
+    dispatcher_parser.add_argument(
+        "--expected-owner-gid",
+        required=True,
+        type=int,
+    )
+    dispatcher_parser.add_argument(
+        "--minimum-remaining-seconds",
+        required=True,
+        type=int,
+    )
+    dispatcher_parser.add_argument(
+        "--expiry-evidence",
+        required=True,
+        type=Path,
+    )
     return parser.parse_args()
 
 
@@ -90,7 +129,9 @@ def canonical_query(url: str) -> dict[str, str]:
     return query
 
 
-def validate_expiry(query: dict[str, str]) -> None:
+def validate_expiry(
+    query: dict[str, str],
+) -> tuple[int, datetime, datetime]:
     try:
         signed_at = datetime.strptime(
             query["X-Amz-Date"],
@@ -108,8 +149,10 @@ def validate_expiry(query: dict[str, str]) -> None:
     now = datetime.now(timezone.utc)
     if signed_at > now + timedelta(seconds=MAX_CLOCK_SKEW_SECONDS):
         fail("R2 capability signing time is too far in the future")
-    if now >= signed_at + timedelta(seconds=expiry_seconds):
+    expires_at = signed_at + timedelta(seconds=expiry_seconds)
+    if now >= expires_at:
         fail("R2 capability is already expired")
+    return expiry_seconds, signed_at, expires_at
 
 
 def validate_url(
@@ -118,7 +161,7 @@ def validate_url(
     expected_bucket: str,
     release_sha: str,
     handoff_sha256: str,
-) -> None:
+) -> tuple[int, datetime, datetime]:
     if (
         not url
         or len(url.encode("utf-8")) > MAX_URL_BYTES
@@ -175,7 +218,88 @@ def validate_url(
         fail("R2 capability has an unsupported payload policy")
     if query.get("x-amz-checksum-mode", "ENABLED") != "ENABLED":
         fail("R2 capability has an unsupported checksum mode")
-    validate_expiry(query)
+    return validate_expiry(query)
+
+
+def read_dispatcher_capability(
+    path: Path,
+    expected_identity: str,
+    expected_owner_uid: int,
+    expected_owner_gid: int,
+) -> str:
+    if re.fullmatch(r"[0-9]+:[0-9]+", expected_identity) is None:
+        fail("R2 capability file identity is invalid")
+    if expected_owner_uid < 0 or expected_owner_gid < 0:
+        fail("R2 capability file owner is invalid")
+
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+    )
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_nlink != 1
+        or metadata.st_uid != expected_owner_uid
+        or metadata.st_gid != expected_owner_gid
+        or f"{metadata.st_dev}:{metadata.st_ino}" != expected_identity
+    ):
+        os.close(descriptor)
+        fail("R2 capability file metadata changed before consumption")
+
+    with os.fdopen(descriptor, "rb", closefd=True) as handle:
+        content = handle.read(MAX_URL_BYTES + 2)
+    if content.endswith(b"\n"):
+        content = content[:-1]
+    if (
+        not content
+        or len(content) > MAX_URL_BYTES
+        or any(byte < 33 or byte > 126 for byte in content)
+    ):
+        fail("R2 capability file is not one canonical printable URL")
+    return content.decode("ascii")
+
+
+def validate_dispatcher_lifetime(
+    expiry_seconds: int,
+    signed_at: datetime,
+    expires_at: datetime,
+    minimum_remaining_seconds: int,
+) -> None:
+    if not 1 <= minimum_remaining_seconds <= MAX_EXPIRY_SECONDS:
+        fail("minimum R2 capability lifetime is invalid")
+    now = datetime.now(timezone.utc)
+    remaining_seconds = int((expires_at - now).total_seconds())
+    if (
+        expiry_seconds != MAX_EXPIRY_SECONDS
+        or signed_at > now + timedelta(seconds=60)
+        or remaining_seconds < minimum_remaining_seconds
+        or remaining_seconds > MAX_EXPIRY_SECONDS
+    ):
+        fail("R2 capability has insufficient dispatcher lifetime")
+
+
+def write_expiry_evidence(path: Path, expires_at: datetime) -> None:
+    descriptor = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o600,
+    )
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_nlink != 1
+        or metadata.st_uid != os.getuid()
+        or metadata.st_gid != os.getgid()
+    ):
+        os.close(descriptor)
+        fail("R2 capability expiry evidence was not created safely")
+    with os.fdopen(descriptor, "w", encoding="ascii", newline="\n") as handle:
+        handle.write(f"{int(expires_at.timestamp())}\n")
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def write_curl_config(path: Path, url: str) -> None:
@@ -204,15 +328,35 @@ def main() -> int:
     if SHA256.fullmatch(arguments.handoff_sha256) is None:
         fail("handoff SHA-256 is invalid")
 
-    capability = os.environ.get("SPY_R2_HANDOFF_PRESIGNED_URL", "")
-    validate_url(
+    if arguments.mode == "workflow":
+        capability = os.environ.get("SPY_R2_HANDOFF_PRESIGNED_URL", "")
+    else:
+        capability = read_dispatcher_capability(
+            arguments.capability_file,
+            arguments.expected_file_identity,
+            arguments.expected_owner_uid,
+            arguments.expected_owner_gid,
+        )
+
+    expiry_seconds, signed_at, expires_at = validate_url(
         capability,
         arguments.expected_endpoint_host,
         arguments.expected_bucket,
         arguments.release_sha,
         arguments.handoff_sha256,
     )
-    write_curl_config(arguments.curl_config, capability)
+    if arguments.mode == "workflow":
+        write_curl_config(arguments.curl_config, capability)
+    else:
+        validate_dispatcher_lifetime(
+            expiry_seconds,
+            signed_at,
+            expires_at,
+            arguments.minimum_remaining_seconds,
+        )
+        write_expiry_evidence(arguments.expiry_evidence, expires_at)
+        sys.stdout.buffer.write(capability.encode("ascii"))
+        sys.stdout.buffer.flush()
     return 0
 
 
