@@ -102,6 +102,23 @@ cleanup() {
 trap cleanup EXIT
 umask 077
 
+validate_source_deploy_key() {
+  local key_comment
+  local key_data
+  local key_type
+  local public_key="${temporary_root}/source-deploy-key.pub"
+
+  ssh-keygen -y -f "${deploy_key}" >"${public_key}" 2>/dev/null
+  [[ "$(wc -l <"${public_key}")" == "1" ]] ||
+    fail "source deploy key is not one canonical Ed25519 key"
+  # OpenSSH may append an opaque private-key comment; key identity is two fields.
+  IFS=' ' read -r key_type key_data key_comment <"${public_key}"
+  [[ "${key_type}" == "ssh-ed25519" ]] ||
+    fail "source deploy key is not one canonical Ed25519 key"
+  [[ "${key_data}" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] ||
+    fail "source deploy key is not one canonical Ed25519 key"
+}
+
 SPY_R2_HANDOFF_PRESIGNED_URL="${r2_handoff_capability}" /usr/bin/python3 -I \
   "${script_root}/validate-r2-capability.py" \
   workflow \
@@ -146,9 +163,7 @@ printf '%s' "${source_deploy_key_b64}" |
   base64 --decode >"${deploy_key}"
 chmod 0600 "${deploy_key}"
 unset source_deploy_key_b64 SPY_SOURCE_DEPLOY_PRIVATE_KEY_B64
-ssh-keygen -y -f "${deploy_key}" 2>/dev/null |
-  grep -Eq '^ssh-ed25519 [A-Za-z0-9+/]+={0,2}$' ||
-  fail "source deploy key is not one canonical Ed25519 key"
+validate_source_deploy_key
 
 cat >"${ssh_config}" <<EOF
 Host github.com
