@@ -16,8 +16,12 @@ from typing import Any, NoReturn
 GIT_ID = re.compile(r"^[a-f0-9]{40}$")
 SHA256 = re.compile(r"^[a-f0-9]{64}$")
 POLICY_TAG = re.compile(r"^spy-sign-policy-([a-f0-9]{40})$")
+SIGN_RUN_TITLE = re.compile(
+    r"^spy-sign-([a-f0-9]{40})-([a-f0-9]{64})-([a-f0-9]{40})$"
+)
 SIGNER_REPOSITORY = "sudiakov/spy-release-signer"
 SOURCE_REPOSITORY = "sudiakov/spy"
+SIGN_WORKFLOW_NAME = "Sign exact Spy release"
 ASSET_NAMES = {
     "SIGNING_POLICY_REF",
     "SIGNING_POLICY_REF_MANIFEST.sha256",
@@ -137,6 +141,7 @@ def validate_run_binding(
     signer_sha: str,
     *,
     require_first_attempt: bool,
+    allow_pending_path: bool = False,
 ) -> int:
     run_id = run.get("id")
     run_attempt = run.get("run_attempt")
@@ -147,6 +152,9 @@ def validate_run_binding(
         f"{workflow_path}@{signer_tag}",
         f"{workflow_path}@refs/tags/{signer_tag}",
     }
+    path = run.get("path")
+    path_is_exact = isinstance(path, str) and path in allowed_workflow_paths
+    path_is_pending = allow_pending_path and (path is None or path == "")
     if (
         not isinstance(run_id, int)
         or isinstance(run_id, bool)
@@ -154,7 +162,7 @@ def validate_run_binding(
         or run.get("event") != "workflow_dispatch"
         or run.get("head_branch") != signer_tag
         or run.get("head_sha") != signer_sha
-        or run.get("path") not in allowed_workflow_paths
+        or not (path_is_exact or path_is_pending)
         or not isinstance(run_attempt, int)
         or isinstance(run_attempt, bool)
         or run_attempt < 1
@@ -170,6 +178,14 @@ def validate_run_binding(
     ):
         fail("dispatched run is not bound to the exact policy tag and commit")
     return run_id
+
+
+def expected_run_title(
+    release_sha: str,
+    handoff_sha256: str,
+    signer_sha: str,
+) -> str:
+    return f"spy-sign-{release_sha}-{handoff_sha256}-{signer_sha}"
 
 
 def validate_inventory_run_binding(
@@ -439,9 +455,7 @@ def validate_run(arguments: argparse.Namespace) -> None:
     else:
         fail("workflow run API did not return a JSON object")
 
-    title = (
-        f"spy-sign-{release_sha}-{handoff_sha256}-{signer_sha}"
-    )
+    title = expected_run_title(release_sha, handoff_sha256, signer_sha)
     relevant: list[dict[str, Any]] = []
     for run in runs:
         run_id = run.get("id")
@@ -465,6 +479,87 @@ def validate_run(arguments: argparse.Namespace) -> None:
         require_first_attempt=True,
     )
     print(run_id)
+
+
+def validate_direct_run(arguments: argparse.Namespace) -> None:
+    """Classify one run ID returned by the canonical dispatch response.
+
+    GitHub's dispatch endpoint returns the authoritative run ID before every
+    eventually-consistent run projection is necessarily populated. Core
+    authority mismatches remain fatal; only the title and an empty path may be
+    reported as pending until the bounded dispatcher observation converges.
+    """
+
+    release_sha = arguments.release_sha
+    handoff_sha256 = arguments.handoff_sha256
+    repository = arguments.repository
+    signer_tag = arguments.signer_tag
+    signer_sha = arguments.signer_sha
+    expected_run_id = arguments.expected_run_id
+    if (
+        GIT_ID.fullmatch(release_sha) is None
+        or SHA256.fullmatch(handoff_sha256) is None
+        or repository != SIGNER_REPOSITORY
+        or signer_tag != f"spy-sign-policy-{release_sha}"
+        or GIT_ID.fullmatch(signer_sha) is None
+        or arguments.baseline_run_id < 0
+        or expected_run_id <= arguments.baseline_run_id
+    ):
+        fail("expected direct signer run identity is not canonical")
+
+    payload = read_json(arguments.run_json)
+    if not isinstance(payload, dict) or "workflow_runs" in payload:
+        fail("direct workflow run API did not return one JSON object")
+    if payload.get("name") != SIGN_WORKFLOW_NAME:
+        fail("direct workflow run name differs from the signer workflow")
+    observed_run_id = validate_run_binding(
+        payload,
+        repository,
+        signer_tag,
+        signer_sha,
+        require_first_attempt=True,
+        allow_pending_path=True,
+    )
+    if observed_run_id != expected_run_id:
+        fail("direct workflow run ID differs from the dispatch response")
+
+    workflow_path = ".github/workflows/sign-release.yml"
+    allowed_workflow_paths = {
+        workflow_path,
+        f"{workflow_path}@{signer_tag}",
+        f"{workflow_path}@refs/tags/{signer_tag}",
+    }
+    expected_title = expected_run_title(
+        release_sha,
+        handoff_sha256,
+        signer_sha,
+    )
+    observed_title = payload.get("display_title")
+    if observed_title is not None and not isinstance(observed_title, str):
+        fail("direct workflow run title is malformed")
+    if observed_title not in {None, "", SIGN_WORKFLOW_NAME, expected_title}:
+        if isinstance(observed_title, str) and SIGN_RUN_TITLE.fullmatch(
+            observed_title
+        ):
+            fail("direct workflow run title conflicts with dispatch inputs")
+        fail("direct workflow run has an unknown pending title")
+    exact_projection = (
+        observed_title == expected_title
+        and isinstance(payload.get("path"), str)
+        and payload.get("path") in allowed_workflow_paths
+    )
+    print(
+        json.dumps(
+            {
+                "classification": (
+                    "exact" if exact_projection else "pending_projection"
+                ),
+                "run_id": observed_run_id,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    )
 
 
 def valid_started_at(value: Any) -> bool:
@@ -630,6 +725,17 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--run-json", type=Path, required=True)
     run.add_argument("--allow-none", action="store_true")
     run.set_defaults(handler=validate_run)
+
+    direct_run = subparsers.add_parser("direct-run")
+    direct_run.add_argument("--release-sha", required=True)
+    direct_run.add_argument("--handoff-sha256", required=True)
+    direct_run.add_argument("--repository", required=True)
+    direct_run.add_argument("--signer-tag", required=True)
+    direct_run.add_argument("--signer-sha", required=True)
+    direct_run.add_argument("--baseline-run-id", type=int, required=True)
+    direct_run.add_argument("--expected-run-id", type=int, required=True)
+    direct_run.add_argument("--run-json", type=Path, required=True)
+    direct_run.set_defaults(handler=validate_direct_run)
 
     job = subparsers.add_parser("job")
     job.add_argument("--repository", required=True)
