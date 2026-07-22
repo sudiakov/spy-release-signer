@@ -337,6 +337,27 @@ def list_release_entries(
     )
 
 
+def resolve_inventoried_regular_file(
+    release_root: Path,
+    relative: str,
+    files: dict[str, Path],
+) -> Path:
+    validate_relative_path(relative)
+    canonical_release_root = release_root.resolve(strict=True)
+    try:
+        resolved = (release_root / relative).resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise ValueError(
+            f"release is missing required regular file '{relative}'"
+        ) from error
+    if not resolved.is_relative_to(canonical_release_root):
+        fail(f"release is missing required regular file '{relative}'")
+    resolved_relative = resolved.relative_to(canonical_release_root).as_posix()
+    if files.get(resolved_relative) != resolved:
+        fail(f"release is missing required regular file '{relative}'")
+    return resolved
+
+
 def parse_manifest(content: bytes) -> dict[str, str]:
     try:
         text = content.decode("ascii")
@@ -409,17 +430,22 @@ def verify_release(
         "config/web.env.example",
         "ops/apache/spy.noeryx.com.application.conf",
         "ops/auth-browser-acceptance/dist/main.mjs",
-        "ops/auth-browser-acceptance/node_modules/@playwright/test/package.json",
+        "ops/auth-browser-acceptance/node_modules/.pnpm/"
+        "@playwright+test@1.61.1/node_modules/@playwright/test/package.json",
         "ops/auth-browser-acceptance/node_modules/.pnpm/playwright@1.61.1/"
         "node_modules/playwright/package.json",
         "ops/auth-browser-acceptance/node_modules/.pnpm/playwright-core@1.61.1/"
         "node_modules/playwright-core/package.json",
         "ops/auth-browser-acceptance/package.json",
         "ops/r2-production-acceptance/dist/main.mjs",
-        "ops/r2-production-acceptance/node_modules/@aws-sdk/client-s3/package.json",
-        "ops/r2-production-acceptance/node_modules/@aws-sdk/s3-request-presigner/"
+        "ops/r2-production-acceptance/node_modules/.pnpm/"
+        "@aws-sdk+client-s3@3.1090.0/node_modules/@aws-sdk/client-s3/"
         "package.json",
-        "ops/r2-production-acceptance/node_modules/zod/package.json",
+        "ops/r2-production-acceptance/node_modules/.pnpm/"
+        "@aws-sdk+s3-request-presigner@3.1090.0/node_modules/@aws-sdk/"
+        "s3-request-presigner/package.json",
+        "ops/r2-production-acceptance/node_modules/.pnpm/zod@4.4.3/"
+        "node_modules/zod/package.json",
         "ops/r2-production-acceptance/package.json",
         "ops/check-node-runtime.mjs",
         "ops/systemd/spy-control-worker.service",
@@ -516,6 +542,43 @@ def verify_release(
         fail("release symlink inventory is not in canonical byte order")
     if recorded_links != links:
         fail("release symlink inventory does not match")
+
+    required_runtime_links = {
+        "ops/auth-browser-acceptance/node_modules/@playwright/test": (
+            "../.pnpm/@playwright+test@1.61.1/node_modules/@playwright/test"
+        ),
+        "ops/r2-production-acceptance/node_modules/@aws-sdk/client-s3": (
+            "../.pnpm/@aws-sdk+client-s3@3.1090.0/node_modules/@aws-sdk/"
+            "client-s3"
+        ),
+        "ops/r2-production-acceptance/node_modules/@aws-sdk/"
+        "s3-request-presigner": (
+            "../.pnpm/@aws-sdk+s3-request-presigner@3.1090.0/node_modules/"
+            "@aws-sdk/s3-request-presigner"
+        ),
+        "ops/r2-production-acceptance/node_modules/zod": (
+            ".pnpm/zod@4.4.3/node_modules/zod"
+        ),
+    }
+    for relative, target in required_runtime_links.items():
+        if links.get(relative) != target:
+            fail(
+                f"release required runtime link '{relative}' "
+                "does not match its exact target"
+            )
+
+    required_resolved_files = {
+        "ops/auth-browser-acceptance/node_modules/@playwright/test/package.json",
+        "ops/r2-production-acceptance/node_modules/@aws-sdk/client-s3/package.json",
+        "ops/r2-production-acceptance/node_modules/@aws-sdk/s3-request-presigner/"
+        "package.json",
+        "ops/r2-production-acceptance/node_modules/zod/package.json",
+    }
+    for relative in sorted(
+        required_resolved_files,
+        key=lambda value: value.encode("ascii"),
+    ):
+        resolve_inventoried_regular_file(release_root, relative, files)
 
     provenance_fields = (
         "format",
