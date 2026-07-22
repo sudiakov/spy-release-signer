@@ -510,8 +510,6 @@ def validate_direct_run(arguments: argparse.Namespace) -> None:
     payload = read_json(arguments.run_json)
     if not isinstance(payload, dict) or "workflow_runs" in payload:
         fail("direct workflow run API did not return one JSON object")
-    if payload.get("name") != SIGN_WORKFLOW_NAME:
-        fail("direct workflow run name differs from the signer workflow")
     observed_run_id = validate_run_binding(
         payload,
         repository,
@@ -534,6 +532,15 @@ def validate_direct_run(arguments: argparse.Namespace) -> None:
         handoff_sha256,
         signer_sha,
     )
+    observed_name = payload.get("name")
+    if observed_name is not None and not isinstance(observed_name, str):
+        fail("direct workflow run name is malformed")
+    if observed_name not in {None, "", SIGN_WORKFLOW_NAME, expected_title}:
+        if isinstance(observed_name, str) and SIGN_RUN_TITLE.fullmatch(
+            observed_name
+        ):
+            fail("direct workflow run name conflicts with dispatch inputs")
+        fail("direct workflow run has an unknown pending name")
     observed_title = payload.get("display_title")
     if observed_title is not None and not isinstance(observed_title, str):
         fail("direct workflow run title is malformed")
@@ -544,7 +551,8 @@ def validate_direct_run(arguments: argparse.Namespace) -> None:
             fail("direct workflow run title conflicts with dispatch inputs")
         fail("direct workflow run has an unknown pending title")
     exact_projection = (
-        observed_title == expected_title
+        observed_name in {SIGN_WORKFLOW_NAME, expected_title}
+        and observed_title == expected_title
         and isinstance(payload.get("path"), str)
         and payload.get("path") in allowed_workflow_paths
     )
