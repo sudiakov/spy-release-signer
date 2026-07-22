@@ -29,10 +29,12 @@ fail() {
 [[ -n "${repository_token}" ]] ||
   fail "signer repository token is unavailable"
 
-for command in bash chmod cut dirname mktemp python3 rm sha256sum; do
+for command in bash chmod cut dirname mktemp rm sha256sum; do
   command -v "${command}" >/dev/null 2>&1 ||
     fail "required command '${command}' is unavailable"
 done
+[[ -x /usr/bin/python3 ]] ||
+  fail "isolated system Python is unavailable"
 
 script_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 repository_root="$(cd "${script_root}/.." && pwd -P)"
@@ -58,7 +60,7 @@ trap cleanup EXIT
 umask 077
 : >"${temporary_root}/policy-output"
 
-python3 \
+/usr/bin/python3 -I \
   "${script_root}/validate-release-policy.py" \
   --policy "${policy_path}" \
   --release-sha "${release_sha}" \

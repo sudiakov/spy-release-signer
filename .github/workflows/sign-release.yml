@@ -52,7 +52,7 @@ jobs:
           SPY_SOURCE_REPOSITORY: ${{ vars.SPY_SOURCE_REPOSITORY }}
         run: |
           set -euo pipefail
-          /usr/bin/python3 scripts/validate-release-policy.py \
+          /usr/bin/python3 -I scripts/validate-release-policy.py \
             --policy "policies/${RELEASE_SHA}.policy" \
             --release-sha "${RELEASE_SHA}" \
             --source-repository "${SPY_SOURCE_REPOSITORY}" \
@@ -125,7 +125,7 @@ jobs:
             "${SPY_POLICY_RELEASE_MANIFEST_SHA256}" \
             "${RELEASE_SHA}" \
             "${GITHUB_SHA}"
-          /usr/bin/python3 scripts/verify-and-sign-release.py \
+          /usr/bin/python3 -I scripts/verify-and-sign-release.py \
             --request "${source_root}/spy-signer-request-${RELEASE_SHA}.txt" \
             --source-evidence "${source_root}/SOURCE_EVIDENCE" \
             --archive "${source_root}/spy-application-${RELEASE_SHA}.tar.gz" \

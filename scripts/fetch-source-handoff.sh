@@ -11,9 +11,11 @@ approved_git_tree="${3:-}"
 output_argument="${4:-}"
 source_repository="${SPY_SOURCE_REPOSITORY:-}"
 source_deploy_key_b64="${SPY_SOURCE_DEPLOY_PRIVATE_KEY_B64:-}"
+r2_handoff_capability="${SPY_R2_HANDOFF_PRESIGNED_URL:-}"
 handoff_bucket="${SPY_R2_HANDOFF_BUCKET_NAME:-}"
 handoff_endpoint_host="${SPY_R2_EU_ENDPOINT_HOST:-}"
 expected_signer_sha="${SPY_EXPECTED_SIGNER_SHA:-}"
+unset SPY_SOURCE_DEPLOY_PRIVATE_KEY_B64 SPY_R2_HANDOFF_PRESIGNED_URL
 
 fail() {
   echo "Spy source handoff fetch failed: $*" >&2
@@ -56,7 +58,6 @@ for command in \
   grep \
   install \
   mktemp \
-  python3 \
   rm \
   sha256sum \
   ssh \
@@ -67,6 +68,8 @@ do
   command -v "${command}" >/dev/null 2>&1 ||
     fail "required command '${command}' is unavailable"
 done
+[[ -x /usr/bin/python3 ]] ||
+  fail "isolated system Python is unavailable"
 
 [[ -d "${output_argument}" && ! -L "${output_argument}" ]] ||
   fail "output directory must be a non-symbolic-link directory"
@@ -91,13 +94,53 @@ git_repository="${temporary_root}/source.git"
 cleanup() {
   local exit_status="$?"
   trap - EXIT
-  unset source_deploy_key_b64 SPY_R2_HANDOFF_PRESIGNED_URL
+  unset source_deploy_key_b64 r2_handoff_capability
   chmod -R u+w "${temporary_root}" 2>/dev/null || true
   rm -rf -- "${temporary_root}"
   exit "${exit_status}"
 }
 trap cleanup EXIT
 umask 077
+
+SPY_R2_HANDOFF_PRESIGNED_URL="${r2_handoff_capability}" /usr/bin/python3 -I \
+  "${script_root}/validate-r2-capability.py" \
+  workflow \
+  --expected-endpoint-host "${handoff_endpoint_host}" \
+  --expected-bucket "${handoff_bucket}" \
+  --release-sha "${release_sha}" \
+  --handoff-sha256 "${handoff_sha256}" \
+  --curl-config "${curl_config}"
+unset r2_handoff_capability
+
+download_status="$(
+  curl \
+  --disable \
+  --config "${curl_config}" \
+  --proto '=https' \
+  --tlsv1.2 \
+  --fail \
+  --silent \
+  --show-error \
+  --connect-timeout 10 \
+  --max-time 600 \
+  --max-filesize 2148534272 \
+  --output "${handoff_bundle}" \
+  --write-out '%{http_code} %{num_redirects}'
+)" ||
+  fail "the exact private R2 handoff could not be downloaded"
+[[ "${download_status}" == "200 0" ]] ||
+  fail "the exact private R2 handoff returned a redirect or non-200 status"
+rm -f -- "${curl_config}"
+[[ -f "${handoff_bundle}" && ! -L "${handoff_bundle}" ]] ||
+  fail "downloaded R2 handoff is not one regular file"
+[[ "$(stat -c '%s' -- "${handoff_bundle}")" -le 2148534272 ]] ||
+  fail "downloaded R2 handoff exceeds its fixed size limit"
+downloaded_handoff_sha256="$(
+  sha256sum "${handoff_bundle}" |
+    cut -d ' ' -f1
+)"
+[[ "${downloaded_handoff_sha256}" == "${handoff_sha256}" ]] ||
+  fail "downloaded R2 handoff differs from the dispatched SHA-256"
 
 printf '%s' "${source_deploy_key_b64}" |
   base64 --decode >"${deploy_key}"
@@ -177,45 +220,7 @@ git_tree="$(
 [[ "${git_tree}" == "${approved_git_tree}" ]] ||
   fail "fetched source tree differs from the protected release policy"
 
-/usr/bin/python3 \
-  "${script_root}/validate-r2-capability.py" \
-  --expected-endpoint-host "${handoff_endpoint_host}" \
-  --expected-bucket "${handoff_bucket}" \
-  --release-sha "${release_sha}" \
-  --handoff-sha256 "${handoff_sha256}" \
-  --curl-config "${curl_config}"
-unset SPY_R2_HANDOFF_PRESIGNED_URL
-
-download_status="$(
-  curl \
-  --config "${curl_config}" \
-  --proto '=https' \
-  --tlsv1.2 \
-  --fail \
-  --silent \
-  --show-error \
-  --connect-timeout 10 \
-  --max-time 600 \
-  --max-filesize 2148534272 \
-  --output "${handoff_bundle}" \
-  --write-out '%{http_code} %{num_redirects}'
-)" ||
-  fail "the exact private R2 handoff could not be downloaded"
-[[ "${download_status}" == "200 0" ]] ||
-  fail "the exact private R2 handoff returned a redirect or non-200 status"
-rm -f -- "${curl_config}"
-[[ -f "${handoff_bundle}" && ! -L "${handoff_bundle}" ]] ||
-  fail "downloaded R2 handoff is not one regular file"
-[[ "$(stat -c '%s' -- "${handoff_bundle}")" -le 2148534272 ]] ||
-  fail "downloaded R2 handoff exceeds its fixed size limit"
-downloaded_handoff_sha256="$(
-  sha256sum "${handoff_bundle}" |
-    cut -d ' ' -f1
-)"
-[[ "${downloaded_handoff_sha256}" == "${handoff_sha256}" ]] ||
-  fail "downloaded R2 handoff differs from the dispatched SHA-256"
-
-/usr/bin/python3 \
+/usr/bin/python3 -I \
   "${script_root}/extract-signer-handoff.py" \
   --bundle "${handoff_bundle}" \
   --output-directory "${output_dir}" \
