@@ -30,9 +30,6 @@ MAX_MEMBER_BYTES = 2 * 1024 * 1024 * 1024
 MAX_MEMBERS = 500_000
 MAX_PATH_BYTES = 4096
 OPENSSL = "/usr/bin/openssl"
-SUPABASE_ROOT_CA_SHA256 = (
-    "700723581420dd1ac98fd7e9ac529f0ef210eadcaf87fc868a3ad7d114c2f3b7"
-)
 
 REQUEST_FIELDS = (
     "format",
@@ -426,7 +423,6 @@ def verify_release(
         "config/control-worker.env.example",
         "config/reconciler.env.example",
         "config/release.env",
-        "config/supabase-prod-ca-2021.crt",
         "config/web.env.example",
         "ops/apache/spy.noeryx.com.application.conf",
         "ops/auth-browser-acceptance/dist/main.mjs",
@@ -621,14 +617,8 @@ def verify_release(
         f"{request['git_commit']}\n".encode()
     ):
         fail("RELEASE_SHA does not match the signing request")
-    if sha256_file(files["config/supabase-prod-ca-2021.crt"]) != (
-        SUPABASE_ROOT_CA_SHA256
-    ):
-        fail("release Supabase Root CA differs from signer policy")
     if read_limited(files["config/release.env"]) != (
         "NODE_ENV=production\n"
-        "NODE_EXTRA_CA_CERTS=/srv/spy/current/config/"
-        "supabase-prod-ca-2021.crt\n"
         f"SPY_RELEASE_SHA={request['git_commit']}\n"
     ).encode():
         fail("release runtime identity is not canonical")
